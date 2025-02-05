@@ -12,7 +12,10 @@ This project provides an end-to-end solution to analyze the sentiment of YouTube
 - **Output**: The sentiment predictions are returned as a JSON response.
 
 ---
+## Screenshots
 
+![App Screenshot]([https://via.placeholder.com/468x300?text=App+Screenshot+Here](https://github.com/sakshamsain/SentimentAnalysis/blob/main/Screenshot%202025-02-05%20113444.png))
+![App Screenshot]([https://via.placeholder.com/468x300?text=App+Screenshot+Here](https://github.com/sakshamsain/SentimentAnalysis/blob/main/Screenshot%202025-02-05%20113559.png))
 ## Table of Contents
 
 - [Project Overview](#project-overview)
