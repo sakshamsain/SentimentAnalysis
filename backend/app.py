@@ -2,9 +2,6 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from pymongo import MongoClient
 import torch
-import tensorflow as tf
-from tensorflow import keras
-from keras.utils import pad_sequences
 import pickle
 import requests
 import numpy as np
@@ -12,6 +9,7 @@ import logging
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 from config import Config
 from sentiment_model import sentimentBiLSTM
+from threading import Timer  # For scheduling deletion
 
 # Configure logging for debugging.
 logging.basicConfig(level=logging.DEBUG)
@@ -41,7 +39,7 @@ output_size = 3
 
 # Initialize the model.
 # We use a dummy embedding matrix (zeros) of shape [vocab_size, embedding_dim] 
-# because the actual trained embeddings are in the saved state.
+# because the actual trained embeddings are contained in the saved weights.
 dummy_embedding = np.zeros((vocab_size, embedding_dim))
 model = sentimentBiLSTM(dummy_embedding, hidden_dim, output_size)
 model = model.to(torch.device("cpu"))
@@ -56,7 +54,9 @@ except Exception as e:
     raise e
 
 def extract_video_id(url):
-    """Extract the YouTube video ID from a standard URL format."""
+    """
+    Extract the YouTube video ID from a standard URL format.
+    """
     from urllib.parse import urlparse, parse_qs
     query = urlparse(url).query
     params = parse_qs(query)
@@ -98,6 +98,15 @@ def predict_sentiment(comments):
     label_map = {0: "Negative", 1: "Neutral", 2: "Positive"}
     return [label_map.get(int(p), "Unknown") for p in preds]
 
+def schedule_mongo_deletion(video_id, delay=5):
+    """
+    Schedules deletion of MongoDB documents matching the given video_id after the specified delay (in seconds).
+    """
+    def delete_docs():
+        result = collection.delete_many({"video_id": video_id})
+        logging.info(f"Deleted {result.deleted_count} documents for video_id: {video_id}")
+    Timer(delay, delete_docs).start()
+
 @app.route("/predict", methods=["POST"])
 def predict():
     try:
@@ -105,21 +114,23 @@ def predict():
         video_url = data.get("video_url")
         if not video_url:
             return jsonify({"message": "No video URL provided"}), 400
-        
+
         # Fetch comments for the URL.
         comments = fetch_youtube_comments(video_url)
-        
+
         # Optionally store comments in MongoDB.
         if comments:
             video_id = extract_video_id(video_url)
             docs = [{"video_id": video_id, "comment": comment} for comment in comments]
             collection.insert_many(docs)
-        
+            # Schedule deletion of these documents after 5 seconds.
+            schedule_mongo_deletion(video_id, delay=5)
+
         # Get sentiment predictions.
         sentiments = predict_sentiment(comments)
         results = [{"comment": c, "sentiment": s} for c, s in zip(comments, sentiments)]
         return jsonify(results)
-        
+
     except Exception as e:
         logging.exception("Error in /predict endpoint:")
         return jsonify({"error": str(e)}), 500
