@@ -1,68 +1,79 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from pymongo import MongoClient
-import torch
+import tensorflow as tf
 import pickle
 import requests
-import numpy as np
 import logging
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 from config import Config
-from sentiment_model import sentimentBiLSTM
-from threading import Timer  # For scheduling deletion
-
-# Configure logging for debugging.
-logging.basicConfig(level=logging.DEBUG)
-
+import re
+import nltk
+from nltk.corpus import stopwords
+from nltk.stem import SnowballStemmer
+from threading import Timer
 app = Flask(__name__)
 CORS(app)
-app.config["DEBUG"] = Config.DEBUG
 
-# Connect to MongoDB.
+
+# Connect to MongoDB
 client = MongoClient(Config.MONGO_URI)
 db = client[Config.DATABASE_NAME]
 collection = db[Config.COLLECTION_NAME]
 
-# Load the saved Keras tokenizer.
-try:
-    with open("tokenizer.pkl", "rb") as f:
-        tokenizer = pickle.load(f)
-except Exception as e:
-    logging.exception("Error loading tokenizer:")
-    raise e
+# Load the new model and tokenizer
+model = tf.keras.models.load_model('model.h5')
+with open('tokenizer.pkl', 'rb') as handle:
+    tokenizer = pickle.load(handle)
 
-# Determine vocabulary size from the tokenizer.
-vocab_size = len(tokenizer.word_index) + 1
-embedding_dim = 300       # Must match training – typically 300.
-hidden_dim = 64
-output_size = 3
+# Download stopwords if not already downloaded
+nltk.download('stopwords')
 
-# Initialize the model.
-# We use a dummy embedding matrix (zeros) of shape [vocab_size, embedding_dim] 
-# because the actual trained embeddings are contained in the saved weights.
-dummy_embedding = np.zeros((vocab_size, embedding_dim))
-model = sentimentBiLSTM(dummy_embedding, hidden_dim, output_size)
-model = model.to(torch.device("cpu"))
+stop_words = stopwords.words("english")
+stemmer = SnowballStemmer("english")
+TEXT_CLEANING_RE = "@\S+|https?:\S+|http?:\S|[^A-Za-z0-9]+"
+SEQUENCE_LENGTH = Config.MAX_LEN  # Ensure this matches your training setup
 
-# Load model weights saved during training (assumed saved as model_best.pt).
-try:
-    state_dict = torch.load("model_best.pt", map_location=torch.device("cpu"))
-    model.load_state_dict(state_dict)
-    model.eval()
-except Exception as e:
-    logging.exception("Error loading model weights:")
-    raise e
+def preprocess(text, stem=False):
+    text = re.sub(TEXT_CLEANING_RE, ' ', str(text).lower()).strip()
+    tokens = []
+    for token in text.split():
+        if token not in stop_words:
+            if stem:
+                tokens.append(stemmer.stem(token))
+            else:
+                tokens.append(token)
+    return " ".join(tokens)
+
+# Assuming you have defined NEUTRAL, NEGATIVE, POSITIVE, SENTIMENT_THRESHOLDS
+NEUTRAL = "Neutral"
+NEGATIVE = "Negative"
+POSITIVE = "Positive"
+SENTIMENT_THRESHOLDS = [0.4, 0.7]  # Example thresholds
+
+def decode_sentiment(score, include_neutral=True):
+    if include_neutral:
+        label = NEUTRAL
+        if score <= SENTIMENT_THRESHOLDS[0]:
+            label = NEGATIVE
+        elif score >= SENTIMENT_THRESHOLDS[1]:
+            label = POSITIVE
+        return label
+    else:
+        return NEGATIVE if score < 0.5 else POSITIVE
+
 
 def extract_video_id(url):
-    """
-    Extract the YouTube video ID from a standard URL format.
-    """
     from urllib.parse import urlparse, parse_qs
     query = urlparse(url).query
     params = parse_qs(query)
     if "v" in params and params["v"]:
         return params["v"][0]
     else:
+        # Handle shortened YouTube URLs (e.g., youtu.be)
+        path = urlparse(url).path
+        if path.startswith("/"):
+            return path.split("/")[1]
         raise ValueError("Invalid YouTube URL. Could not extract video ID.")
 
 def fetch_youtube_comments(video_url):
@@ -79,29 +90,26 @@ def fetch_youtube_comments(video_url):
         comment = item["snippet"]["topLevelComment"]["snippet"]["textOriginal"]
         comments.append(comment)
     return comments
-
 def predict_sentiment(comments):
-    """
-    Converts comments to padded sequences using the tokenizer and returns sentiment predictions.
-    """
     if not comments:
         raise ValueError("No comments to analyze.")
-    # Convert texts to sequences.
-    sequences = tokenizer.texts_to_sequences(comments)
-    # Pad sequences to the maximum length (Config.MAX_LEN).
-    padded = pad_sequences(sequences, maxlen=Config.MAX_LEN, padding='post', truncating='post')
-    inputs = torch.tensor(padded, dtype=torch.long)
-    with torch.no_grad():
-        outputs = model(inputs)
-    # Get index of maximum predicted value for each sample.
-    preds = torch.argmax(outputs, dim=1).numpy()
-    label_map = {0: "Negative", 1: "Neutral", 2: "Positive"}
-    return [label_map.get(int(p), "Unknown") for p in preds]
+    
+    # Preprocess comments
+    preprocessed_comments = [preprocess(comment) for comment in comments]
+    
+    # Vectorize the preprocessed text
+    sequences = tokenizer.texts_to_sequences(preprocessed_comments)
+    padded = pad_sequences(sequences, maxlen=SEQUENCE_LENGTH)
+    
+    # Make predictions
+    scores = model.predict(padded, verbose=0)
+    
+    # Decode the predictions
+    predictions = [decode_sentiment(score[0], include_neutral=True) for score in scores]
+    
+    return predictions
 
-def schedule_mongo_deletion(video_id, delay=5):
-    """
-    Schedules deletion of MongoDB documents matching the given video_id after the specified delay (in seconds).
-    """
+def schedule_mongo_deletion(video_id, delay=500000):
     def delete_docs():
         result = collection.delete_many({"video_id": video_id})
         logging.info(f"Deleted {result.deleted_count} documents for video_id: {video_id}")
@@ -114,23 +122,26 @@ def predict():
         video_url = data.get("video_url")
         if not video_url:
             return jsonify({"message": "No video URL provided"}), 400
-
+        
         # Fetch comments for the URL.
         comments = fetch_youtube_comments(video_url)
-
+        
         # Optionally store comments in MongoDB.
         if comments:
             video_id = extract_video_id(video_url)
             docs = [{"video_id": video_id, "comment": comment} for comment in comments]
             collection.insert_many(docs)
+            
             # Schedule deletion of these documents after 5 seconds.
-            schedule_mongo_deletion(video_id, delay=5)
-
-        # Get sentiment predictions.
+            schedule_mongo_deletion(video_id, delay=50000)
+        
+        # Get sentiment predictions using the new model.
         sentiments = predict_sentiment(comments)
+        
         results = [{"comment": c, "sentiment": s} for c, s in zip(comments, sentiments)]
+        
         return jsonify(results)
-
+    
     except Exception as e:
         logging.exception("Error in /predict endpoint:")
         return jsonify({"error": str(e)}), 500
