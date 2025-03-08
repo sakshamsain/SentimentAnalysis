@@ -1,5 +1,5 @@
-# YouTube Sentiment Analysis Project
-
+# YouTube Sentiment Analysis Project 
+##model: https://drive.google.com/file/d/1oGhYKPYM0IggSGqWcsZJfB7lNzAne7bc/view?usp=sharing
 This project provides an end-to-end solution to analyze the sentiment of YouTube video comments using a trained BiLSTM model. The solution consists of a model training pipeline (in `model.py`) and a Flask backend API (in `app.py`), which together perform the following steps:
 
 - **Input**: A YouTube video URL is provided.
